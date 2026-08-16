@@ -1,0 +1,126 @@
+const db = require('../database/db');
+const callStateManager = require('../calls/call.state');
+
+function setupSignalingSocket(io) {
+  io.on('connection', (socket) => {
+    const user = socket.user;
+    console.log(`[SOCKET] Client connected: ${user.email} (${user.role}) [Socket: ${socket.id}]`);
+
+    // Associate socket with user presence
+    db.associateSocket(socket.id, user.uid);
+
+    // Broadcast presence update to admins
+    broadcastPresenceUpdate(io);
+
+    // --- 1. USER REGISTRATION / FCM TOKEN UPDATE ---
+    socket.on('register-fcm-token', ({ fcmToken }) => {
+      if (fcmToken) {
+        db.updateFcmToken(user.uid, fcmToken);
+        console.log(`[FCM] Token updated for ${user.email}`);
+      }
+    });
+
+    // --- 2. CALL INITIATION (ADMIN ONLY) ---
+    socket.on('call-user', async (data, callback) => {
+      try {
+        const { receiverId, callType } = data; // callType: 'AUDIO' | 'VIDEO'
+        const session = await callStateManager.initiateCall({
+          caller: user,
+          receiverId,
+          callType,
+          io
+        });
+
+        if (typeof callback === 'function') {
+          callback({ success: true, callSession: session });
+        }
+      } catch (error) {
+        console.error(`[SOCKET] Call initiation error for Admin ${user.email}:`, error.message);
+        if (typeof callback === 'function') {
+          callback({ success: false, error: error.message });
+        }
+      }
+    });
+
+    // --- 3. WEBRTC SIGNALING: OFFER ---
+    socket.on('offer', (data) => {
+      const { callId, sdp, targetUid } = data;
+      console.log(`[WEBRTC] Forwarding SDP Offer for call ${callId} to ${targetUid}`);
+
+      const call = db.getCall(callId);
+      if (call) {
+        db.updateCallStatus(callId, 'NEGOTIATING');
+      }
+
+      const targetSockets = db.getUserSocketIds(targetUid);
+      targetSockets.forEach(sId => {
+        io.to(sId).emit('offer', { callId, sdp, senderUid: user.uid });
+      });
+    });
+
+    // --- 4. WEBRTC SIGNALING: ANSWER ---
+    socket.on('answer', (data) => {
+      const { callId, sdp, targetUid } = data;
+      console.log(`[WEBRTC] Forwarding SDP Answer for call ${callId} to ${targetUid}`);
+
+      const call = db.getCall(callId);
+      if (call) {
+        db.updateCallStatus(callId, 'CONNECTING');
+      }
+
+      const targetSockets = db.getUserSocketIds(targetUid);
+      targetSockets.forEach(sId => {
+        io.to(sId).emit('answer', { callId, sdp, senderUid: user.uid });
+      });
+    });
+
+    // --- 5. WEBRTC SIGNALING: ICE CANDIDATE ---
+    socket.on('ice-candidate', (data) => {
+      const { callId, candidate, targetUid } = data;
+
+      const targetSockets = db.getUserSocketIds(targetUid);
+      targetSockets.forEach(sId => {
+        io.to(sId).emit('ice-candidate', { callId, candidate, senderUid: user.uid });
+      });
+    });
+
+    // --- 6. CALL CONNECTED NOTIFICATION ---
+    socket.on('call-connected', ({ callId }) => {
+      console.log(`[CALL] WebRTC peer connection established for call ${callId}`);
+      db.updateCallStatus(callId, 'CONNECTED');
+
+      const call = db.getCall(callId);
+      if (call) {
+        const callerSockets = db.getUserSocketIds(call.callerId);
+        const receiverSockets = db.getUserSocketIds(call.receiverId);
+        [...callerSockets, ...receiverSockets].forEach(sId => {
+          io.to(sId).emit('call-connected', { callId, connectedAt: call.connectedAt });
+        });
+      }
+    });
+
+    // --- 7. END CALL ---
+    socket.on('end-call', ({ callId, reason }) => {
+      console.log(`[CALL] End call requested for ${callId} by ${user.email}`);
+      callStateManager.endCall(callId, reason || 'USER_DISCONNECTED', io);
+    });
+
+    // --- 8. HEARTBEAT & DISCONNECT ---
+    socket.on('heartbeat', () => {
+      socket.emit('heartbeat-ack', { serverTime: Date.now() });
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.log(`[SOCKET] Client disconnected: ${user.email} (${reason})`);
+      db.removeSocket(socket.id);
+      broadcastPresenceUpdate(io);
+    });
+  });
+}
+
+function broadcastPresenceUpdate(io) {
+  const users = db.getAllUsers();
+  io.emit('presence-update', users);
+}
+
+module.exports = setupSignalingSocket;
